@@ -35,7 +35,7 @@ void main() {
     expect(calls.lastWhere((c) => c.method == 'SystemChrome.setPreferredOrientations').arguments,
       ['DeviceOrientation.portraitUp', 'DeviceOrientation.portraitDown']);
     expect(calls.lastWhere((c) => c.method == 'SystemChrome.setEnabledSystemUIMode').arguments,
-      containsPair('mode', 'SystemUiMode.edgeToEdge'));
+      'SystemUiMode.edgeToEdge');
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
