@@ -16,7 +16,7 @@ import '../widgets/gamepad_controls.dart';
 
 // Vrai périphérique Xbox (BTN_TL/TR, EV_ABS dpad, BTN_MODE hotkey)
 const _padScript = r'''
-import sys, time, select
+import sys, time, select, os, fcntl
 try:
     from evdev import UInput, AbsInfo, ecodes as e
 except ImportError:
@@ -38,8 +38,32 @@ capabilities = {
         (e.ABS_RY, AbsInfo(0, -32768, 32767, 0, 2048, 0)),
     ],
 }
-ui = UInput(capabilities, name="Foclabroc-VPad", vendor=0x045e,
-            product=0x028e, version=0x0114, bustype=e.BUS_USB)
+# Each SSH process owns one player slot. flock releases it even after a crash.
+lock_dir = os.environ.get("VPAD_LOCK_DIR", "/tmp/foclabroc-vpad")
+os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+player_lock = None
+player = None
+for candidate in range(1, 5):
+    handle = open(os.path.join(lock_dir, f"player-{candidate}.lock"), "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        continue
+    player_lock = handle
+    player = candidate
+    break
+if player_lock is None:
+    print("ERR:players_busy", flush=True)
+    sys.exit(1)
+try:
+    ui = UInput(capabilities, name=f"Foclabroc-VPad P{player}", vendor=0x045e,
+                product=0x028e, version=0x0114, bustype=e.BUS_USB,
+                phys=f"foclabroc/vpad/player-{player}")
+except Exception as ex:
+    player_lock.close()
+    print(f"ERR:{ex}", flush=True)
+    sys.exit(1)
 buttons = {
     "a": e.BTN_A, "b": e.BTN_B, "x": e.BTN_X, "y": e.BTN_Y,
     "l1": e.BTN_TL, "r1": e.BTN_TR,
@@ -59,17 +83,20 @@ def reset():
     ui.syn()
 
 time.sleep(0.2)
-print("READY", flush=True)
+print(f"READY:{player}", flush=True)
 # Read bytes directly: TextIO buffering can hide commands from select().
 buffer = b""
 last_input = time.monotonic()
 try:
     while True:
         if not select.select([sys.stdin], [], [], 0.5)[0]:
-            if time.monotonic() - last_input > 2:
+            idle = time.monotonic() - last_input
+            if idle > 2:
                 reset()
+            if idle > 10:
+                break
             continue
-        chunk = __import__("os").read(sys.stdin.fileno(), 4096)
+        chunk = os.read(sys.stdin.fileno(), 4096)
         if not chunk:
             break
         last_input = time.monotonic()
@@ -106,8 +133,11 @@ try:
         if len(buffer) > 4096:
             buffer = b""
 finally:
-    reset()
-    ui.close()
+    try:
+        reset()
+        ui.close()
+    finally:
+        player_lock.close()
 ''';
 
 // Clavier virtuel Linux standard
@@ -312,11 +342,11 @@ class _DeviceSession extends ChangeNotifier {
   bool _closed = false;
   int _generation = 0;
   SSHSession? _session;
+  int? player;
   bool ready = false;
   bool starting = false;
   String? error;
 
-  final String scriptName;
   final String scriptContent;
   final void Function(VoidCallback) _update;
 
@@ -327,7 +357,6 @@ class _DeviceSession extends ChangeNotifier {
   }
 
   _DeviceSession({
-    required this.scriptName,
     required this.scriptContent,
     required void Function(VoidCallback) setState,
   }) : _update = setState;
@@ -338,6 +367,7 @@ class _DeviceSession extends ChangeNotifier {
     setState(() {
       starting = true;
       error = null;
+      player = null;
     });
 
     try {
@@ -345,14 +375,12 @@ class _DeviceSession extends ChangeNotifier {
       if (!state.isConnected) throw Exception('Non connecté');
 
       final b64 = base64.encode(utf8.encode(scriptContent));
-      await state.ssh.execute('echo "$b64" | base64 -d > /tmp/$scriptName');
-
       if (_closed || generation != _generation) return;
       final client = state.ssh.client;
       if (client == null) throw Exception('client SSH non disponible');
 
       final session = await client.execute(
-        'python3 -u /tmp/$scriptName',
+        'python3 -u -c "import base64; exec(base64.b64decode(\'$b64\'))"',
       );
       if (_closed || generation != _generation) {
         session.close();
@@ -361,9 +389,17 @@ class _DeviceSession extends ChangeNotifier {
       _session = session;
 
       final completer = Completer<void>();
-      _output = session.stdout.cast<List<int>>().transform(utf8.decoder).listen((data) {
-        if (data.contains('READY') && !completer.isCompleted) completer.complete();
-        if (data.contains('ERR:') && !completer.isCompleted) completer.completeError(data.trim());
+      _output = session.stdout.cast<List<int>>().transform(utf8.decoder)
+          .transform(const LineSplitter()).listen((data) {
+        if ((data == 'READY' || data.startsWith('READY:')) && !completer.isCompleted) {
+          player = data.startsWith('READY:') ? int.tryParse(data.substring(6)) : null;
+          completer.complete();
+        }
+        if (data.startsWith('ERR:') && !completer.isCompleted) {
+          completer.completeError(data == 'ERR:players_busy'
+              ? 'Les quatre places VPad sont occupées. Déconnectez une manette et réessayez.'
+              : data.substring(4));
+        }
       }, onDone: () {
         if (generation != _generation || _closed) return;
         _heartbeat?.cancel();
@@ -453,12 +489,10 @@ class _VirtualPadScreenState extends State<VirtualPadScreen> with WidgetsBinding
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _pad = _DeviceSession(
-      scriptName: 'foclabrocvpad.py',
       scriptContent: _padScript,
       setState: (fn) { if (mounted) setState(fn); },
     );
     _kb = _DeviceSession(
-      scriptName: 'foclabrocvkb.py',
       scriptContent: _kbScript,
       setState: (fn) { if (mounted) setState(fn); },
     );
@@ -575,7 +609,7 @@ class _FullscreenPadState extends State<_FullscreenPad>
           IconButton(onPressed: _exit, icon: const Icon(Icons.fullscreen_exit),
             tooltip: 'Quitter le plein écran'),
           Expanded(child: Text(
-            widget.session.ready ? 'Xbox • Foclabroc-VPad' : 'Manette déconnectée',
+            widget.session.ready ? 'Xbox • Foclabroc-VPad • P${widget.session.player}' : 'Manette déconnectée',
             style: TextStyle(color: widget.session.ready ? Colors.greenAccent : Colors.amberAccent))),
           if (widget.session.starting)
             const Padding(padding: EdgeInsets.all(12),
@@ -812,7 +846,8 @@ class _PadSection extends StatelessWidget {
     return Column(
       children: [
         _DeviceStatusBar(
-          label: 'FoclabrocVpad',
+          label: session.ready && session.player != null
+              ? 'FoclabrocVpad • P${session.player}' : 'FoclabrocVpad',
           ready: session.ready,
           starting: session.starting,
           error: session.error,
