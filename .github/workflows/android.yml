@@ -41,17 +41,13 @@ jobs:
           flutter-version: '3.41.0'
           cache: true
       - name: Install dependencies from lockfile
-        run: |
-          flutter pub get
-          echo LOCKFILE_START
-          cat pubspec.lock
-          echo LOCKFILE_END
+        run: flutter pub get --enforce-lockfile
       - name: Analyze source
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build release APK
         run: flutter build apk --release
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: foclabroc-remote-${{ matrix.language }}-apk
           path: ${{ matrix.directory }}/build/app/outputs/flutter-apk/app-release.apk
