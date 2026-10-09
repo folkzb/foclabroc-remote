@@ -42,6 +42,11 @@ jobs:
           cache: true
       - name: Install dependencies from lockfile
         run: flutter pub get --enforce-lockfile
+      - name: Test uinput protocol
+        if: matrix.language == 'fr'
+        run: python3 "$GITHUB_WORKSPACE/tests/test_vpad_protocol.py"
+      - name: Test controller widgets
+        run: flutter test
       - name: Analyze source
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build release APK

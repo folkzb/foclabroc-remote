@@ -7,6 +7,8 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../models/app_state.dart';
+import '../widgets/back_handler.dart';
+import '../widgets/gamepad_controls.dart';
 
 // ─────────────────────────────────────────────
 //  PYTHON SCRIPTS
@@ -14,69 +16,98 @@ import '../models/app_state.dart';
 
 // Vrai périphérique Xbox (BTN_TL/TR, EV_ABS dpad, BTN_MODE hotkey)
 const _padScript = r'''
-import sys, time
+import sys, time, select
 try:
     from evdev import UInput, AbsInfo, ecodes as e
 except ImportError:
-    print("ERR:evdev not found")
+    print("ERR:evdev not found", flush=True)
     sys.exit(1)
 
 capabilities = {
     e.EV_KEY: [
         e.BTN_A, e.BTN_B, e.BTN_X, e.BTN_Y,
-        e.BTN_TL, e.BTN_TR,
-        e.BTN_SELECT, e.BTN_START,
-        e.BTN_MODE,
-        e.BTN_THUMBL, e.BTN_THUMBR,
+        e.BTN_TL, e.BTN_TR, e.BTN_SELECT, e.BTN_START,
+        e.BTN_MODE, e.BTN_THUMBL, e.BTN_THUMBR,
     ],
-    e.EV_ABS: {
-        e.ABS_HAT0X: AbsInfo(value=0, min=-1, max=1, fuzz=0, flat=0, resolution=0),
-        e.ABS_HAT0Y: AbsInfo(value=0, min=-1, max=1, fuzz=0, flat=0, resolution=0),
-    },
+    e.EV_ABS: [
+        (e.ABS_HAT0X, AbsInfo(0, -1, 1, 0, 0, 0)),
+        (e.ABS_HAT0Y, AbsInfo(0, -1, 1, 0, 0, 0)),
+        (e.ABS_X, AbsInfo(0, -32768, 32767, 0, 2048, 0)),
+        (e.ABS_Y, AbsInfo(0, -32768, 32767, 0, 2048, 0)),
+        (e.ABS_RX, AbsInfo(0, -32768, 32767, 0, 2048, 0)),
+        (e.ABS_RY, AbsInfo(0, -32768, 32767, 0, 2048, 0)),
+    ],
 }
-
-ui = UInput(capabilities, name="Foclabroc-VPad", vendor=0x045e, product=0x028e, version=0x0114, bustype=e.BUS_USB)
-time.sleep(0.2)
-print("READY")
-sys.stdout.flush()
-
+ui = UInput(capabilities, name="Foclabroc-VPad", vendor=0x045e,
+            product=0x028e, version=0x0114, bustype=e.BUS_USB)
 buttons = {
     "a": e.BTN_A, "b": e.BTN_B, "x": e.BTN_X, "y": e.BTN_Y,
     "l1": e.BTN_TL, "r1": e.BTN_TR,
-    "start": e.BTN_START, "select": e.BTN_SELECT,
-    "hotkey": e.BTN_MODE,
+    "start": e.BTN_START, "select": e.BTN_SELECT, "hotkey": e.BTN_MODE,
+    "l3": e.BTN_THUMBL, "r3": e.BTN_THUMBR,
 }
+sticks = {"left": (e.ABS_X, e.ABS_Y), "right": (e.ABS_RX, e.ABS_RY)}
+directions = {"left", "right", "up", "down"}
+held = set()
 
-dpad = {
-    "left":  (e.ABS_HAT0X, -1),
-    "right": (e.ABS_HAT0X,  1),
-    "up":    (e.ABS_HAT0Y, -1),
-    "down":  (e.ABS_HAT0Y,  1),
-}
-
-while True:
-    try:
-        line = sys.stdin.readline()
-        if not line:
-            break
-        line = line.strip().lower()
-    except Exception:
-        break
-    if line == "quit":
-        break
-    parts = line.split()
-    if len(parts) != 2:
-        continue
-    action, key = parts
-    value = 1 if action == "press" else 0
-    if key in dpad:
-        axis, direction = dpad[key]
-        ui.write(e.EV_ABS, axis, direction if value else 0)
-    elif key in buttons:
-        ui.write(e.EV_KEY, buttons[key], value)
+def reset():
+    held.clear()
+    for code in buttons.values():
+        ui.write(e.EV_KEY, code, 0)
+    for code in (e.ABS_HAT0X, e.ABS_HAT0Y, e.ABS_X, e.ABS_Y, e.ABS_RX, e.ABS_RY):
+        ui.write(e.EV_ABS, code, 0)
     ui.syn()
 
-ui.close()
+time.sleep(0.2)
+print("READY", flush=True)
+# Read bytes directly: TextIO buffering can hide commands from select().
+buffer = b""
+last_input = time.monotonic()
+try:
+    while True:
+        if not select.select([sys.stdin], [], [], 0.5)[0]:
+            if time.monotonic() - last_input > 2:
+                reset()
+            continue
+        chunk = __import__("os").read(sys.stdin.fileno(), 4096)
+        if not chunk:
+            break
+        last_input = time.monotonic()
+        buffer += chunk
+        while b"\n" in buffer:
+            raw, buffer = buffer.split(b"\n", 1)
+            parts = raw.decode("utf-8", errors="ignore").strip().lower().split()
+            if parts == ["quit"]:
+                sys.exit(0)
+            if parts == ["reset"]:
+                reset()
+                continue
+            if len(parts) == 4 and parts[0] == "stick" and parts[1] in sticks:
+                try:
+                    x, y = (max(-32768, min(32767, int(v))) for v in parts[2:])
+                except ValueError:
+                    continue
+                axis_x, axis_y = sticks[parts[1]]
+                ui.write(e.EV_ABS, axis_x, x)
+                ui.write(e.EV_ABS, axis_y, y)
+                ui.syn()
+            elif len(parts) == 2 and parts[0] in ("press", "release"):
+                action, key = parts
+                if key in directions:
+                    if action == "press":
+                        held.add(key)
+                    else:
+                        held.discard(key)
+                    ui.write(e.EV_ABS, e.ABS_HAT0X, int("right" in held) - int("left" in held))
+                    ui.write(e.EV_ABS, e.ABS_HAT0Y, int("down" in held) - int("up" in held))
+                elif key in buttons:
+                    ui.write(e.EV_KEY, buttons[key], int(action == "press"))
+                ui.syn()
+        if len(buffer) > 4096:
+            buffer = b""
+finally:
+    reset()
+    ui.close()
 ''';
 
 // Clavier virtuel Linux standard
@@ -275,7 +306,11 @@ ui.close()
 //  DEVICE SESSION
 // ─────────────────────────────────────────────
 
-class _DeviceSession {
+class _DeviceSession extends ChangeNotifier {
+  Timer? _heartbeat;
+  StreamSubscription<String>? _output;
+  bool _closed = false;
+  int _generation = 0;
   SSHSession? _session;
   bool ready = false;
   bool starting = false;
@@ -283,16 +318,23 @@ class _DeviceSession {
 
   final String scriptName;
   final String scriptContent;
-  final void Function(VoidCallback) setState;
+  final void Function(VoidCallback) _update;
+
+  void setState(VoidCallback fn) {
+    if (_closed) return;
+    _update(fn);
+    notifyListeners();
+  }
 
   _DeviceSession({
     required this.scriptName,
     required this.scriptContent,
-    required this.setState,
-  });
+    required void Function(VoidCallback) setState,
+  }) : _update = setState;
 
   Future<void> start(BuildContext context) async {
-    if (starting || ready) return;
+    if (_closed || starting || ready) return;
+    final generation = ++_generation;
     setState(() {
       starting = true;
       error = null;
@@ -305,29 +347,51 @@ class _DeviceSession {
       final b64 = base64.encode(utf8.encode(scriptContent));
       await state.ssh.execute('echo "$b64" | base64 -d > /tmp/$scriptName');
 
+      if (_closed || generation != _generation) return;
       final client = state.ssh.client;
       if (client == null) throw Exception('client SSH non disponible');
 
       final session = await client.execute(
         'python3 -u /tmp/$scriptName',
       );
+      if (_closed || generation != _generation) {
+        session.close();
+        return;
+      }
       _session = session;
 
       final completer = Completer<void>();
-      late StreamSubscription sub;
-      sub = session.stdout.cast<List<int>>().transform(utf8.decoder).listen((data) {
+      _output = session.stdout.cast<List<int>>().transform(utf8.decoder).listen((data) {
         if (data.contains('READY') && !completer.isCompleted) completer.complete();
         if (data.contains('ERR:') && !completer.isCompleted) completer.completeError(data.trim());
+      }, onDone: () {
+        if (generation != _generation || _closed) return;
+        _heartbeat?.cancel();
+        if (!completer.isCompleted) completer.completeError('Manette déconnectée');
+        setState(() { ready = false; starting = false; });
+        _session?.close();
+        ++_generation;
+      }, onError: (Object err) {
+        if (generation != _generation || _closed) return;
+        _heartbeat?.cancel();
+        if (!completer.isCompleted) completer.completeError(err);
+        setState(() { ready = false; starting = false; error = err.toString(); });
       });
 
       await completer.future.timeout(const Duration(seconds: 5));
-      await sub.cancel();
+      if (_closed || generation != _generation) return;
+      _heartbeat = Timer.periodic(const Duration(milliseconds: 500), (_) => send('ping'));
 
       setState(() {
         ready = true;
         starting = false;
       });
     } catch (e) {
+      if (_closed || generation != _generation) return;
+      _heartbeat?.cancel();
+      _output?.cancel();
+      _session?.close();
+      _session = null;
       setState(() {
         starting = false;
         ready = false;
@@ -337,16 +401,31 @@ class _DeviceSession {
   }
 
   void stop(BuildContext context) {
+    ++_generation;
+    _heartbeat?.cancel();
+    _output?.cancel();
     try {
       send('quit');
       _session?.close();
     } catch (_) {}
     _session = null;
-    setState(() => ready = false);
+    setState(() { ready = false; starting = false; });
+  }
+
+  @override
+  void dispose() {
+    ++_generation;
+    send('reset');
+    send('quit');
+    _closed = true;
+    _heartbeat?.cancel();
+    _output?.cancel();
+    _session?.close();
+    super.dispose();
   }
 
   void send(String cmd) {
-    if (!ready) return;
+    if (_closed || !ready) return;
     try {
       _session?.stdin.add(utf8.encode('$cmd\n'));
     } catch (_) {}
@@ -364,13 +443,15 @@ class VirtualPadScreen extends StatefulWidget {
   State<VirtualPadScreen> createState() => _VirtualPadScreenState();
 }
 
-class _VirtualPadScreenState extends State<VirtualPadScreen> {
+class _VirtualPadScreenState extends State<VirtualPadScreen> with WidgetsBindingObserver {
+  bool _openingFullscreen = false;
   late final _DeviceSession _pad;
   late final _DeviceSession _kb;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _pad = _DeviceSession(
       scriptName: 'foclabrocvpad.py',
       scriptContent: _padScript,
@@ -385,13 +466,43 @@ class _VirtualPadScreenState extends State<VirtualPadScreen> {
 
   @override
   void dispose() {
-    _pad.stop(context);
-    _kb.stop(context);
+    WidgetsBinding.instance.removeObserver(this);
+    _pad.dispose();
+    _kb.dispose();
     super.dispose();
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) _pad.send('reset');
+  }
+
+  Future<void> _openFullscreen() async {
+    if (_openingFullscreen) return;
+    setState(() => _openingFullscreen = true);
+    _pad.send('reset');
+    _kb.stop(context);
+    try {
+      await SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      if (!mounted) return;
+      await Navigator.of(context, rootNavigator: true).push<void>(
+        MaterialPageRoute(builder: (_) => _FullscreenPad(session: _pad)));
+    } finally {
+      _pad.send('reset');
+      await SystemChrome.setPreferredOrientations([
+        DeviceOrientation.portraitUp, DeviceOrientation.portraitDown]);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      if (mounted) setState(() => _openingFullscreen = false);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    if (_openingFullscreen) {
+      return const Scaffold(backgroundColor: Color(0xFF0D0F14));
+    }
     return Scaffold(
       backgroundColor: const Color(0xFF0D0F14),
       body: SafeArea(
@@ -399,7 +510,7 @@ class _VirtualPadScreenState extends State<VirtualPadScreen> {
           children: [
             Expanded(flex: 5, child: _KeyboardSection(session: _kb)),
             Container(height: 1, margin: const EdgeInsets.symmetric(horizontal: 16), color: Colors.white10),
-            Expanded(flex: 6, child: _PadSection(session: _pad)),
+            Expanded(flex: 6, child: _PadSection(session: _pad, onFullscreen: _openFullscreen)),
           ],
         ),
       ),
@@ -410,6 +521,86 @@ class _VirtualPadScreenState extends State<VirtualPadScreen> {
 // ─────────────────────────────────────────────
 //  KEYBOARD SECTION
 // ─────────────────────────────────────────────
+
+class _FullscreenPad extends StatefulWidget {
+  final _DeviceSession session;
+  const _FullscreenPad({required this.session});
+  @override
+  State<_FullscreenPad> createState() => _FullscreenPadState();
+}
+
+class _FullscreenPadState extends State<_FullscreenPad>
+    with WidgetsBindingObserver {
+  bool _closing = false;
+  bool _active = true;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    TabBackHandler.register(1, () {
+      _exit();
+      return true;
+    });
+  }
+
+  void _exit() {
+    if (_closing) return;
+    _closing = true;
+    widget.session.send('reset');
+    Navigator.of(context).pop();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    widget.session.send('reset');
+    setState(() => _active = state == AppLifecycleState.resumed);
+  }
+
+  @override
+  void dispose() {
+    widget.session.send('reset');
+    TabBackHandler.unregister(1);
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: const Color(0xFF0D0F14),
+    body: SafeArea(child: AnimatedBuilder(
+      animation: widget.session,
+      builder: (context, _) => Column(children: [
+        Row(children: [
+          IconButton(onPressed: _exit, icon: const Icon(Icons.fullscreen_exit),
+            tooltip: 'Quitter le plein écran'),
+          Expanded(child: Text(
+            widget.session.ready ? 'Xbox • Foclabroc-VPad' : 'Manette déconnectée',
+            style: TextStyle(color: widget.session.ready ? Colors.greenAccent : Colors.amberAccent))),
+          if (widget.session.starting)
+            const Padding(padding: EdgeInsets.all(12),
+              child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)))
+          else
+            TextButton(
+              onPressed: () {
+                widget.session.send('reset');
+                if (widget.session.ready) {
+                  widget.session.stop(context);
+                } else {
+                  widget.session.start(context);
+                }
+              },
+              child: Text(widget.session.ready ? 'DÉCONNECTER' : 'CONNECTER')),
+        ]),
+        if (widget.session.error != null)
+          Text(widget.session.error!, maxLines: 2, overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Colors.redAccent)),
+        Expanded(child: GamepadControls(
+          enabled: widget.session.ready && _active, send: widget.session.send)),
+      ]),
+    )),
+  );
+}
 
 class _KeyboardSection extends StatefulWidget {
   final _DeviceSession session;
@@ -432,6 +623,7 @@ class _KeyboardSectionState extends State<_KeyboardSection> {
     HapticFeedback.lightImpact();
     widget.session.send('press $key');
     Future.delayed(const Duration(milliseconds: 80), () {
+      if (!mounted) return;
       widget.session.send('release $key');
       if (key != 'shift' && key != 'ctrl' && key != 'alt') {
         if (_shift) { widget.session.send('release shift'); setState(() => _shift = false); }
@@ -612,7 +804,8 @@ class _KbKeyState extends State<_KbKey> {
 
 class _PadSection extends StatelessWidget {
   final _DeviceSession session;
-  const _PadSection({required this.session});
+  final VoidCallback onFullscreen;
+  const _PadSection({required this.session, required this.onFullscreen});
 
   @override
   Widget build(BuildContext context) {
@@ -626,6 +819,9 @@ class _PadSection extends StatelessWidget {
           onConnect: () => session.start(context),
           onDisconnect: () => session.stop(context),
           accentColor: const Color(0xFF50FA7B),
+          action: IconButton(onPressed: onFullscreen,
+            tooltip: 'Manette plein écran',
+            icon: const Icon(Icons.fullscreen, color: Colors.greenAccent)),
         ),
         if (session.starting)
           const Expanded(child: Center(child: CircularProgressIndicator(color: Color(0xFF50FA7B), strokeWidth: 2)))
@@ -678,13 +874,13 @@ class _PadSection extends StatelessWidget {
                             child: Stack(
                               children: [
                                 Positioned(left: 45, top: 6,
-                                  child: _ActionButtonFilled(label: 'Y', color: Colors.green, onDown: () => session.send('press y'), onUp: () => session.send('release y'))),
+                                  child: _ActionButtonFilled(label: 'Y', color: Colors.amber, onDown: () => session.send('press y'), onUp: () => session.send('release y'))),
                                 Positioned(left: 45, top: 96,
-                                  child: _ActionButtonFilled(label: 'A', color: Colors.red, onDown: () => session.send('press a'), onUp: () => session.send('release a'))),
+                                  child: _ActionButtonFilled(label: 'A', color: Colors.green, onDown: () => session.send('press a'), onUp: () => session.send('release a'))),
                                 Positioned(left: 0, top: 51,
                                   child: _ActionButtonFilled(label: 'X', color: Colors.blue, onDown: () => session.send('press x'), onUp: () => session.send('release x'))),
                                 Positioned(left: 90, top: 51,
-                                  child: _ActionButtonFilled(label: 'B', color: Colors.orange, onDown: () => session.send('press b'), onUp: () => session.send('release b'))),
+                                  child: _ActionButtonFilled(label: 'B', color: Colors.red, onDown: () => session.send('press b'), onUp: () => session.send('release b'))),
                               ],
                             ),
                           ),
@@ -726,6 +922,7 @@ class _DeviceStatusBar extends StatelessWidget {
   final VoidCallback onConnect;
   final VoidCallback onDisconnect;
   final Color accentColor;
+  final Widget? action;
 
   const _DeviceStatusBar({
     required this.label,
@@ -735,6 +932,7 @@ class _DeviceStatusBar extends StatelessWidget {
     required this.onConnect,
     required this.onDisconnect,
     required this.accentColor,
+    this.action,
   });
 
   @override
@@ -752,11 +950,13 @@ class _DeviceStatusBar extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 6),
-          Text(
+          Expanded(child: Text(
             ready ? '$label connecté' : '$label déconnecté',
             style: const TextStyle(color: Colors.white38, fontSize: 11, fontWeight: FontWeight.w600),
-          ),
-          const Spacer(),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          )),
+          if (action != null) action!,
           if (!starting)
             GestureDetector(
               onTap: ready ? onDisconnect : onConnect,
